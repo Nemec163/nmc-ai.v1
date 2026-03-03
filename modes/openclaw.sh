@@ -322,6 +322,8 @@ ensure_openclaw_user_systemd_runtime() {
   OPENCLAW_USER_SYSTEMD_READY=0
   OPENCLAW_SYSTEMCTL_MODE=""
 
+  ensure_openclaw_user_systemd_layout
+
   if (( DRY_RUN )); then
     log_info "[dry-run] проверка user-systemd runtime пропущена"
     OPENCLAW_USER_SYSTEMD_READY=1
@@ -355,6 +357,15 @@ ensure_openclaw_user_systemd_runtime() {
 
   log_warn "systemd user services недоступны для openclaw (No medium found/нет user bus). Будет использован system-level fallback unit."
   return 0
+}
+
+ensure_openclaw_user_systemd_layout() {
+  log_info "Подготовка каталогов user-systemd в home openclaw"
+
+  run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.config
+  run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.config/systemd
+  run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.config/systemd/user
+  run_sudo chown openclaw:openclaw /home/openclaw/.config /home/openclaw/.config/systemd /home/openclaw/.config/systemd/user
 }
 
 ensure_openclaw_gateway_config() {
@@ -581,7 +592,7 @@ PY
 openclaw_gateway_execstart() {
   local resolved
   resolved="$(run_as_openclaw "${OPENCLAW_ENV_EXPORTS} readlink -f \"${OPENCLAW_BIN_PATH}\" 2>/dev/null || true" | tail -n1 | tr -d '\r')"
-  if [[ -n "$resolved" && "$resolved" == *.js ]]; then
+  if [[ -n "$resolved" && ( "$resolved" == *.js || "$resolved" == *.mjs ) ]]; then
     printf '/usr/bin/node %s gateway --port %s' "$resolved" "$OPENCLAW_GATEWAY_PORT"
     return 0
   fi
@@ -677,7 +688,7 @@ NoNewPrivileges=true
 WantedBy=default.target
 EOF
 
-  run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.config/systemd/user
+  ensure_openclaw_user_systemd_layout
   write_root_file "$unit_tmp" "$unit_path" 0644 openclaw openclaw
 
   rm -f "$unit_tmp"
