@@ -10,6 +10,7 @@ OPENCLAW_TAILNET_DNS=""
 OPENCLAW_GATEWAY_UNIT=""
 OPENCLAW_SERVICE_SCOPE="user"
 OPENCLAW_USER_SYSTEMD_READY=0
+OPENCLAW_SYSTEMCTL_MODE=""
 
 ensure_openclaw_preflight() {
   log_info "Проверка preflight (openclaw)"
@@ -245,12 +246,63 @@ run_openclaw_onboard_non_interactive() {
   fi
 }
 
-openclaw_systemctl_user() {
+openclaw_systemctl_user_via_machine() {
+  run_sudo systemctl --machine "openclaw@" --user "$@"
+}
+
+openclaw_systemctl_user_via_bus() {
   run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${OPENCLAW_UID}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${OPENCLAW_UID}/bus" systemctl --user "$@"
 }
 
+detect_openclaw_systemctl_mode() {
+  if [[ "${OPENCLAW_SYSTEMCTL_MODE}" == "machine" || "${OPENCLAW_SYSTEMCTL_MODE}" == "bus" ]]; then
+    return 0
+  fi
+
+  if openclaw_systemctl_user_via_machine show-environment >/dev/null 2>&1; then
+    OPENCLAW_SYSTEMCTL_MODE="machine"
+    return 0
+  fi
+
+  if openclaw_systemctl_user_via_bus show-environment >/dev/null 2>&1; then
+    OPENCLAW_SYSTEMCTL_MODE="bus"
+    return 0
+  fi
+
+  OPENCLAW_SYSTEMCTL_MODE="unavailable"
+  return 1
+}
+
+openclaw_systemctl_user() {
+  if [[ "${OPENCLAW_SYSTEMCTL_MODE}" == "machine" ]]; then
+    if openclaw_systemctl_user_via_machine "$@"; then
+      return 0
+    fi
+    OPENCLAW_SYSTEMCTL_MODE=""
+  elif [[ "${OPENCLAW_SYSTEMCTL_MODE}" == "bus" ]]; then
+    if openclaw_systemctl_user_via_bus "$@"; then
+      return 0
+    fi
+    OPENCLAW_SYSTEMCTL_MODE=""
+  fi
+
+  if ! detect_openclaw_systemctl_mode; then
+    return 1
+  fi
+
+  if [[ "${OPENCLAW_SYSTEMCTL_MODE}" == "machine" ]]; then
+    openclaw_systemctl_user_via_machine "$@"
+    return $?
+  fi
+
+  openclaw_systemctl_user_via_bus "$@"
+}
+
 openclaw_systemd_available() {
-  openclaw_systemctl_user show-environment >/dev/null 2>&1
+  if ! detect_openclaw_systemctl_mode; then
+    return 1
+  fi
+  openclaw_systemctl_user list-unit-files --type=service --no-legend >/dev/null 2>&1
 }
 
 onboard_daemon_flag() {
@@ -268,6 +320,7 @@ ensure_openclaw_user_systemd_runtime() {
 
   OPENCLAW_UID="$(sudo id -u openclaw)"
   OPENCLAW_USER_SYSTEMD_READY=0
+  OPENCLAW_SYSTEMCTL_MODE=""
 
   if (( DRY_RUN )); then
     log_info "[dry-run] проверка user-systemd runtime пропущена"
@@ -276,10 +329,20 @@ ensure_openclaw_user_systemd_runtime() {
   fi
 
   run_sudo loginctl enable-linger openclaw || true
+  run_sudo systemctl enable "user-runtime-dir@${OPENCLAW_UID}.service" || true
+  run_sudo systemctl start "user-runtime-dir@${OPENCLAW_UID}.service" || true
   run_sudo systemctl enable "user@${OPENCLAW_UID}.service" || true
   run_sudo systemctl start "user@${OPENCLAW_UID}.service" || true
   run_sudo install -d -m 0700 -o openclaw -g openclaw "/run/user/${OPENCLAW_UID}"
   run_sudo systemctl status "user@${OPENCLAW_UID}.service" --no-pager >/dev/null 2>&1 || true
+
+  local attempt
+  for attempt in $(seq 1 10); do
+    if run_sudo test -S "/run/user/${OPENCLAW_UID}/bus"; then
+      break
+    fi
+    sleep 1
+  done
 
   if ! run_sudo test -S "/run/user/${OPENCLAW_UID}/bus"; then
     openclaw_systemctl_user start dbus.service || true
@@ -313,6 +376,7 @@ ensure_openclaw_gateway_config() {
   run_sudo python3 - "$config_path" "$OPENCLAW_GATEWAY_PORT" "$OPENCLAW_TAILSCALE_MODE" "$dns" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
@@ -341,6 +405,80 @@ if "resetOnExit" not in tailscale:
 
 gateway["tailscale"] = tailscale
 
+trusted_proxies = gateway.get("trustedProxies")
+if not isinstance(trusted_proxies, list):
+    trusted_proxies = []
+
+normalized_proxies = []
+seen_proxy_keys = set()
+for item in trusted_proxies:
+    value = str(item).strip()
+    if not value:
+        continue
+    key = value.lower()
+    if key in seen_proxy_keys:
+        continue
+    normalized_proxies.append(value)
+    seen_proxy_keys.add(key)
+
+for proxy in ("127.0.0.1", "::1"):
+    if proxy.lower() not in seen_proxy_keys:
+        normalized_proxies.append(proxy)
+        seen_proxy_keys.add(proxy.lower())
+
+gateway["trustedProxies"] = normalized_proxies
+
+recommended_deny = [
+    "canvas.present",
+    "canvas.hide",
+    "canvas.navigate",
+    "canvas.eval",
+    "canvas.snapshot",
+    "canvas.a2ui.push",
+    "canvas.a2ui.pushJSONL",
+    "canvas.a2ui.reset",
+]
+recommended_deny_keys = {x.lower() for x in recommended_deny}
+exact_cmd = re.compile(r"^[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+$")
+
+nodes = gateway.get("nodes")
+if not isinstance(nodes, dict):
+    nodes = {}
+
+deny_commands = nodes.get("denyCommands")
+if isinstance(deny_commands, list):
+    sanitized = []
+    seen_cmd_keys = set()
+    has_ineffective_or_unknown = False
+
+    for item in deny_commands:
+        value = str(item).strip()
+        if not value:
+            continue
+        if not exact_cmd.fullmatch(value):
+            has_ineffective_or_unknown = True
+            continue
+
+        key = value.lower()
+        if key not in recommended_deny_keys:
+            has_ineffective_or_unknown = True
+            continue
+        if key in seen_cmd_keys:
+            continue
+
+        sanitized.append(value)
+        seen_cmd_keys.add(key)
+
+    if has_ineffective_or_unknown:
+        for command in recommended_deny:
+            key = command.lower()
+            if key in seen_cmd_keys:
+                continue
+            sanitized.append(command)
+            seen_cmd_keys.add(key)
+        nodes["denyCommands"] = sanitized
+        gateway["nodes"] = nodes
+
 if dns:
     origin = f"https://{dns}"
     control_ui = gateway.get("controlUi")
@@ -355,11 +493,103 @@ if dns:
     gateway["controlUi"] = control_ui
 
 cfg["gateway"] = gateway
+
+channels = cfg.get("channels")
+if isinstance(channels, dict):
+    telegram = channels.get("telegram")
+    if isinstance(telegram, dict):
+        policy = str(telegram.get("groupPolicy", "")).strip().lower()
+
+        def has_entries(value):
+            return isinstance(value, list) and any(str(x).strip() for x in value)
+
+        if policy == "allowlist":
+            if not has_entries(telegram.get("groupAllowFrom")) and not has_entries(telegram.get("allowFrom")):
+                telegram["groupPolicy"] = "disabled"
+                channels["telegram"] = telegram
+                cfg["channels"] = channels
+
 path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
 PY
 
   run_sudo chown openclaw:openclaw "$config_path"
   run_as_openclaw "mkdir -p ~/.openclaw/credentials && chmod 700 ~/.openclaw/credentials"
+}
+
+harden_openclaw_state_permissions() {
+  log_info "Ужесточение прав на state OpenClaw"
+
+  run_sudo install -d -m 0700 -o openclaw -g openclaw /home/openclaw/.openclaw
+  run_sudo chown openclaw:openclaw /home/openclaw/.openclaw || true
+  run_sudo chmod 700 /home/openclaw/.openclaw || true
+  run_sudo chmod 600 /home/openclaw/.openclaw/openclaw.json || true
+}
+
+install_user_gateway_service_fallback() {
+  log_warn "gateway install через user-systemd завершился ошибкой, пробую ручной user-unit"
+
+  OPENCLAW_SERVICE_SCOPE="user"
+  OPENCLAW_GATEWAY_UNIT="openclaw-gateway.service"
+
+  local launch_script="/home/openclaw/.local/bin/openclaw-gateway-run.sh"
+  local unit_path="/home/openclaw/.config/systemd/user/${OPENCLAW_GATEWAY_UNIT}"
+  local unit_tmp
+  local launch_tmp
+  unit_tmp="$(mktemp)"
+  launch_tmp="$(mktemp)"
+
+cat > "$launch_tmp" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+${OPENCLAW_ENV_EXPORTS}
+if "${OPENCLAW_BIN_PATH}" gateway run --help 2>/dev/null | grep -q -- '--allow-unconfigured'; then
+  exec "${OPENCLAW_BIN_PATH}" gateway run --allow-unconfigured
+else
+  exec "${OPENCLAW_BIN_PATH}" gateway run
+fi
+EOF
+
+  cat > "$unit_tmp" <<EOF
+[Unit]
+Description=OpenClaw Gateway (manual user-unit fallback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/openclaw
+Environment=HOME=/home/openclaw
+ExecStart=${launch_script}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
+EOF
+
+  run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.local/bin
+  run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.config/systemd/user
+  write_root_file "$launch_tmp" "$launch_script" 0755 openclaw openclaw
+  write_root_file "$unit_tmp" "$unit_path" 0644 openclaw openclaw
+
+  rm -f "$unit_tmp" "$launch_tmp"
+
+  if ! openclaw_systemctl_user daemon-reload; then
+    return 1
+  fi
+  if ! openclaw_systemctl_user enable "$OPENCLAW_GATEWAY_UNIT"; then
+    return 1
+  fi
+  if ! openclaw_systemctl_user restart "$OPENCLAW_GATEWAY_UNIT"; then
+    return 1
+  fi
+  if ! openclaw_systemctl_user is-active "$OPENCLAW_GATEWAY_UNIT" >/dev/null 2>&1; then
+    openclaw_systemctl_user status "$OPENCLAW_GATEWAY_UNIT" --no-pager || true
+    return 1
+  fi
+
+  return 0
 }
 
 install_system_gateway_service_fallback() {
@@ -431,7 +661,9 @@ install_and_start_gateway_service() {
   OPENCLAW_SERVICE_SCOPE="user"
 
   if ! run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway install --force"; then
-    log_warn "gateway install через user-systemd завершился ошибкой"
+    if install_user_gateway_service_fallback; then
+      return 0
+    fi
     install_system_gateway_service_fallback
     return 0
   fi
@@ -440,6 +672,9 @@ install_and_start_gateway_service() {
   unit="$(openclaw_systemctl_user list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^openclaw-gateway.*\\.service$' | head -n1 || true)"
   if [[ -z "$unit" ]]; then
     log_warn "После gateway install не найден unit openclaw-gateway*.service"
+    if install_user_gateway_service_fallback; then
+      return 0
+    fi
     install_system_gateway_service_fallback
     return 0
   fi
@@ -452,7 +687,11 @@ install_and_start_gateway_service() {
 
   if ! openclaw_systemctl_user is-active "$OPENCLAW_GATEWAY_UNIT" >/dev/null 2>&1; then
     openclaw_systemctl_user status "$OPENCLAW_GATEWAY_UNIT" --no-pager || true
-    fatal 30 "Gateway unit не перешел в active: $OPENCLAW_GATEWAY_UNIT"
+    if install_user_gateway_service_fallback; then
+      return 0
+    fi
+    install_system_gateway_service_fallback
+    return 0
   fi
 }
 
@@ -464,9 +703,9 @@ configure_tailscale_https_endpoint() {
 
   run_sudo tailscale serve reset || true
 
-  if run_sudo tailscale serve --bg --https=443 / "$target"; then
+  if run_sudo tailscale serve --bg --https=443 "$target"; then
     configured=1
-  elif run_sudo tailscale serve --bg --https=443 "$target"; then
+  elif run_sudo tailscale serve --bg --https=443 / "$target"; then
     configured=1
   elif run_sudo tailscale serve --bg 443 "$target"; then
     configured=1
@@ -503,6 +742,10 @@ run_openclaw_health_checks() {
   log_info "Проверка состояния OpenClaw"
 
   run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" status"
+
+  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" security audit --help 2>/dev/null | grep -q -- '--fix'"; then
+    run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" security audit --fix" || true
+  fi
 
   if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --help 2>/dev/null | grep -q -- '--non-interactive'"; then
     run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --non-interactive" || true
@@ -558,6 +801,7 @@ run_openclaw_mode() {
   fi
 
   ensure_openclaw_gateway_config
+  harden_openclaw_state_permissions
   install_and_start_gateway_service
   wait_for_gateway_probe
   configure_tailscale_https_endpoint
