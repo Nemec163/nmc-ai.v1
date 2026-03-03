@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 
 OPENCLAW_INSTALLER_URLS_DEFAULT="https://install.openclaw.ai/installer.sh https://openclaw.ai/install.sh"
+OPENCLAW_GATEWAY_PORT=${OPENCLAW_GATEWAY_PORT:-18789}
+OPENCLAW_TAILSCALE_MODE=${OPENCLAW_TAILSCALE_MODE:-serve}
 OPENCLAW_ENV_EXPORTS='export PNPM_HOME="$HOME/.local/share/pnpm"; export NPM_CONFIG_PREFIX="$HOME/.npm-global"; export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH";'
 OPENCLAW_BIN_PATH="openclaw"
+OPENCLAW_UID=""
+OPENCLAW_TAILNET_DNS=""
+OPENCLAW_GATEWAY_UNIT=""
 
 ensure_openclaw_preflight() {
   log_info "Проверка preflight (openclaw)"
@@ -26,13 +31,54 @@ ensure_openclaw_preflight() {
     fatal 30 "Пользователь openclaw не найден"
   fi
 
-  require_cmd curl sudo bash || fatal 30 "Не хватает базовых команд для установки OpenClaw"
+  require_cmd curl sudo bash jq tailscale || fatal 30 "Не хватает базовых команд для установки OpenClaw"
+}
+
+ensure_tailscale_online() {
+  log_info "Проверка Tailscale"
+
+  run_sudo systemctl enable --now tailscaled
+
+  if tailscale_online; then
+    OPENCLAW_TAILNET_DNS="$(tailscale_dns_name)"
+    return 0
+  fi
+
+  if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
+    run_sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}"
+  else
+    log_warn "Tailscale не online, требуется интерактивный tailscale up"
+    run_sudo tailscale up
+  fi
+
+  if ! tailscale_online; then
+    fatal 30 "Tailscale остаётся offline. Выполните этап infra повторно и проверьте tailscale up"
+  fi
+
+  OPENCLAW_TAILNET_DNS="$(tailscale_dns_name)"
+}
+
+tailscale_online() {
+  local json
+  json="$(sudo tailscale status --json 2>/dev/null || true)"
+  if [[ -z "$json" ]]; then
+    return 1
+  fi
+
+  printf '%s' "$json" | jq -e '.BackendState == "Running" and (.Self.Online // false) and ((.TailscaleIPs // []) | length > 0)' >/dev/null 2>&1
+}
+
+tailscale_dns_name() {
+  local dns
+  dns="$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//')"
+  printf '%s' "$dns"
 }
 
 ensure_openclaw_user_pnpm_layout() {
   log_info "Подготовка окружения openclaw (pnpm + npm global bin)"
 
-  run_as_openclaw "mkdir -p ~/.local/bin ~/.local/share/pnpm ~/.local/share/pnpm/store ~/.npm-global/bin"
+  run_as_openclaw "mkdir -p ~/.local/bin ~/.local/share/pnpm ~/.local/share/pnpm/store ~/.npm-global/bin ~/.openclaw/credentials"
+  run_as_openclaw "chmod 700 ~/.openclaw/credentials"
   run_as_openclaw "npm config set prefix ~/.npm-global"
   run_as_openclaw "pnpm config set global-dir ~/.local/share/pnpm"
   run_as_openclaw "pnpm config set global-bin-dir ~/.local/bin"
@@ -124,9 +170,30 @@ openclaw_onboard_supports_flag() {
   return 1
 }
 
+onboard_default_flags() {
+  local flags=""
+
+  if openclaw_onboard_supports_flag "--gateway-bind"; then
+    flags+=" --gateway-bind loopback"
+  fi
+
+  if openclaw_onboard_supports_flag "--gateway-port"; then
+    flags+=" --gateway-port ${OPENCLAW_GATEWAY_PORT}"
+  fi
+
+  if openclaw_onboard_supports_flag "--tailscale"; then
+    flags+=" --tailscale ${OPENCLAW_TAILSCALE_MODE}"
+  fi
+
+  printf '%s' "$flags"
+}
+
 run_openclaw_onboard_interactive() {
   log_info "Запуск openclaw onboard --install-daemon (interactive)"
-  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" onboard --install-daemon"
+
+  local flags
+  flags="$(onboard_default_flags)"
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" onboard --install-daemon${flags}"
 }
 
 run_openclaw_onboard_non_interactive() {
@@ -164,40 +231,147 @@ run_openclaw_onboard_non_interactive() {
     cmd+=" --model '${OPENCLAW_MODEL}'"
   fi
 
+  cmd+="$(onboard_default_flags)"
+
   if ! run_as_openclaw_sensitive "$cmd"; then
     log_warn "Non-interactive onboarding не удался, перехожу в interactive режим"
     run_openclaw_onboard_interactive
   fi
 }
 
-verify_openclaw_service() {
-  log_info "Проверка user-systemd сервиса OpenClaw"
+openclaw_systemctl_user() {
+  run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${OPENCLAW_UID}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${OPENCLAW_UID}/bus" systemctl --user "$@"
+}
 
-  local uid
-  uid="$(sudo id -u openclaw)"
+openclaw_systemd_available() {
+  openclaw_systemctl_user show-environment >/dev/null 2>&1
+}
 
-  run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user daemon-reload || true
+ensure_openclaw_user_systemd_runtime() {
+  log_info "Проверка user-systemd runtime для openclaw"
 
-  if run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user is-active openclaw >/dev/null 2>&1; then
-    log_success "User service openclaw активен"
+  OPENCLAW_UID="$(sudo id -u openclaw)"
+
+  run_sudo loginctl enable-linger openclaw || true
+  run_sudo systemctl enable "user@${OPENCLAW_UID}.service" || true
+  run_sudo systemctl start "user@${OPENCLAW_UID}.service" || true
+  run_sudo install -d -m 0700 -o openclaw -g openclaw "/run/user/${OPENCLAW_UID}"
+
+  if ! openclaw_systemd_available; then
+    fatal 30 "systemd user services недоступны для openclaw (ожидался user@${OPENCLAW_UID}.service + dbus-user-session)"
+  fi
+}
+
+ensure_openclaw_gateway_config() {
+  log_info "Приведение gateway конфигурации к tailnet-only (loopback + tailscale serve)"
+
+  local config_path="/home/openclaw/.openclaw/openclaw.json"
+
+  if ! run_sudo test -f "$config_path"; then
+    fatal 30 "Не найден конфиг OpenClaw: $config_path"
+  fi
+
+  if (( DRY_RUN )); then
+    log_info "[dry-run] update $config_path (gateway.bind/port/tailscale)"
     return 0
   fi
 
-  if run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user list-units --type=service --all | grep -qi openclaw; then
-    run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user start openclaw || true
+  local dns="${OPENCLAW_TAILNET_DNS:-}"
+
+  run_sudo python3 - "$config_path" "$OPENCLAW_GATEWAY_PORT" "$OPENCLAW_TAILSCALE_MODE" "$dns" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+port = int(sys.argv[2])
+mode = sys.argv[3]
+dns = sys.argv[4].strip()
+
+raw = path.read_text()
+cfg = json.loads(raw if raw.strip() else "{}")
+
+gateway = cfg.get("gateway")
+if not isinstance(gateway, dict):
+    gateway = {}
+
+gateway["bind"] = "loopback"
+gateway["port"] = port
+
+tailscale = gateway.get("tailscale")
+if not isinstance(tailscale, dict):
+    tailscale = {}
+
+tailscale["mode"] = mode
+if "resetOnExit" not in tailscale:
+    tailscale["resetOnExit"] = False
+
+gateway["tailscale"] = tailscale
+
+if dns:
+    origin = f"https://{dns}"
+    control_ui = gateway.get("controlUi")
+    if not isinstance(control_ui, dict):
+        control_ui = {}
+    allowed = control_ui.get("allowedOrigins")
+    if not isinstance(allowed, list):
+        allowed = []
+    if origin.lower() not in {str(x).lower() for x in allowed}:
+        allowed.append(origin)
+    control_ui["allowedOrigins"] = allowed
+    gateway["controlUi"] = control_ui
+
+cfg["gateway"] = gateway
+path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+PY
+
+  run_sudo chown openclaw:openclaw "$config_path"
+  run_as_openclaw "mkdir -p ~/.openclaw/credentials && chmod 700 ~/.openclaw/credentials"
+}
+
+install_and_start_gateway_service() {
+  log_info "Установка и запуск systemd user-service OpenClaw gateway"
+
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway install --force"
+
+  local unit
+  unit="$(openclaw_systemctl_user list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^openclaw-gateway.*\\.service$' | head -n1 || true)"
+  if [[ -z "$unit" ]]; then
+    fatal 30 "После gateway install не найден unit openclaw-gateway*.service"
   fi
 
-  if run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user list-units --type=service --all | grep -qi openclaw; then
-    log_info "Обнаружен user service с именем, содержащим openclaw"
-  else
-    log_warn "Не найден user-systemd unit с openclaw в имени"
+  OPENCLAW_GATEWAY_UNIT="$unit"
+
+  openclaw_systemctl_user daemon-reload
+  openclaw_systemctl_user enable "$OPENCLAW_GATEWAY_UNIT"
+  openclaw_systemctl_user restart "$OPENCLAW_GATEWAY_UNIT"
+
+  if ! openclaw_systemctl_user is-active "$OPENCLAW_GATEWAY_UNIT" >/dev/null 2>&1; then
+    openclaw_systemctl_user status "$OPENCLAW_GATEWAY_UNIT" --no-pager || true
+    fatal 30 "Gateway unit не перешел в active: $OPENCLAW_GATEWAY_UNIT"
   fi
+}
+
+wait_for_gateway_probe() {
+  log_info "Проверка доступности gateway"
+
+  local attempt
+  for attempt in $(seq 1 30); do
+    if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway probe >/dev/null 2>&1"; then
+      log_success "Gateway успешно отвечает на probe"
+      return 0
+    fi
+    sleep 2
+  done
+
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway status --deep || true"
+  fatal 30 "Gateway не отвечает после запуска сервиса"
 }
 
 run_openclaw_health_checks() {
   log_info "Проверка состояния OpenClaw"
 
-  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" status" || true
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" status"
 
   if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --help 2>/dev/null | grep -q -- '--non-interactive'"; then
     run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --non-interactive" || true
@@ -206,9 +380,28 @@ run_openclaw_health_checks() {
   fi
 
   if run_sudo grep -R -E '0\.0\.0\.0|"host"\s*:\s*"0.0.0.0"' /home/openclaw/.openclaw >/dev/null 2>&1; then
-    log_warn "Обнаружены признаки публичного bind в конфиге OpenClaw. Проверьте tailnet-only конфигурацию"
+    fatal 30 "Обнаружены признаки публичного bind в конфиге OpenClaw (ожидался loopback)"
+  fi
+
+  if ! tailscale_online; then
+    fatal 30 "Tailscale ушел в offline после настройки OpenClaw"
+  fi
+}
+
+print_openclaw_summary() {
+  local dns="${OPENCLAW_TAILNET_DNS:-$(tailscale_dns_name)}"
+
+  log_success "OpenClaw этап завершен"
+  if [[ -n "$OPENCLAW_GATEWAY_UNIT" ]]; then
+    log_info "Gateway unit: ${OPENCLAW_GATEWAY_UNIT} (active)"
+  fi
+
+  log_info "Local UI: http://127.0.0.1:${OPENCLAW_GATEWAY_PORT}/"
+
+  if [[ -n "$dns" ]]; then
+    log_info "Tailscale UI: https://${dns}/"
   else
-    log_success "Явных признаков публичного bind в конфиге OpenClaw не найдено"
+    log_warn "Не удалось определить Tailnet DNS имя для HTTPS URL"
   fi
 }
 
@@ -216,6 +409,7 @@ run_openclaw_mode() {
   ensure_openclaw_preflight
   collect_openclaw_inputs_ru
 
+  ensure_tailscale_online
   ensure_openclaw_user_pnpm_layout
 
   if ! attempt_official_openclaw_install; then
@@ -224,6 +418,7 @@ run_openclaw_mode() {
   fi
 
   verify_openclaw_binary
+  ensure_openclaw_user_systemd_runtime
 
   if [[ "${OPENCLAW_ONBOARD:-interactive}" == "non_interactive" ]]; then
     run_openclaw_onboard_non_interactive
@@ -231,12 +426,13 @@ run_openclaw_mode() {
     run_openclaw_onboard_interactive
   fi
 
-  verify_openclaw_service
+  ensure_openclaw_gateway_config
+  install_and_start_gateway_service
+  wait_for_gateway_probe
   run_openclaw_health_checks
 
   state_set_bool openclaw_completed true
   state_set_string openclaw_completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  log_success "OpenClaw этап завершен"
-  log_info "Docker sandbox OpenClaw целенаправленно не настраивался (по вашей политике)."
+  print_openclaw_summary
 }

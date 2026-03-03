@@ -7,6 +7,7 @@ INFRA_BASE_PACKAGES=(
   lsb-release
   jq
   git
+  dbus-user-session
   ufw
   fail2ban
   unattended-upgrades
@@ -63,6 +64,22 @@ configure_openclaw_user() {
   fi
 
   run_sudo loginctl enable-linger openclaw || true
+}
+
+configure_openclaw_user_runtime() {
+  log_info "Подготовка user-systemd runtime для openclaw"
+
+  local uid
+  uid="$(sudo id -u openclaw)"
+
+  run_sudo loginctl enable-linger openclaw || true
+  run_sudo systemctl enable "user@${uid}.service" || true
+  run_sudo systemctl start "user@${uid}.service" || true
+  run_sudo install -d -m 0700 -o openclaw -g openclaw "/run/user/${uid}"
+
+  if ! run_sudo -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user show-environment >/dev/null 2>&1; then
+    log_warn "user-systemd для openclaw пока не отвечает (будет повторная проверка на этапе openclaw)"
+  fi
 }
 
 configure_openclaw_ssh_keys() {
@@ -322,6 +339,7 @@ run_infra_mode() {
 
   install_base_components
   configure_openclaw_user
+  configure_openclaw_user_runtime
   configure_openclaw_ssh_keys
   install_docker
   install_nodejs_and_pnpm

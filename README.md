@@ -17,8 +17,10 @@
 2. `openclaw` — ставит OpenClaw до production-ready:
 - попытка official installer endpoint
 - fallback на `pnpm install -g openclaw@latest`
-- `openclaw onboard --install-daemon`
-- health checks (`openclaw status`, `openclaw doctor`)
+- `openclaw onboard --install-daemon` + форс `gateway.bind=loopback`
+- форс `gateway.tailscale.mode=serve` (tailnet HTTPS URL)
+- обязательная установка и запуск `openclaw-gateway*.service`
+- health checks (`openclaw status`, `openclaw doctor`, `openclaw gateway probe`)
 
 ## Быстрый старт
 
@@ -95,5 +97,5 @@ chmod +x ./reset-openclaw-stage.sh
 - Скрипт можно запускать от `root` или от обычного sudo-пользователя.
 - После `infra` публичный SSH закрывается; доступ только через Tailscale.
 - Root вход по SSH остаётся разрешён только по ключу (`PermitRootLogin prohibit-password`).
-- Docker sandbox OpenClaw специально не настраивается (по policy проекта).
+- Второй этап считается успешным только если gateway реально поднят и проходит probe.
 - Права `sudo` у `openclaw` требуют пароль; `NOPASSWD` не используется.
