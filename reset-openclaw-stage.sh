@@ -8,18 +8,20 @@ OPENCLAW_HOME="/home/openclaw"
 
 usage() {
   cat <<'USAGE'
-reset-openclaw-stage.sh — полный сброс только второго этапа (openclaw)
+reset-openclaw-stage.sh — полный сброс второго этапа (openclaw)
 
 Что удаляет:
+- официальный OpenClaw uninstall --all (если доступен)
 - user systemd units OpenClaw у пользователя openclaw
 - system-level fallback unit openclaw-gateway-host.service
 - orphan gateway-процессы и занятый порт 18789
-- установленный openclaw (npm/pnpm global)
+- установленный openclaw (user/root npm/pnpm global)
 - бинарники openclaw в ~/.local/bin и ~/.npm-global/bin
-- конфиг/данные ~/.openclaw
+- конфиг/данные ~/.openclaw и XDG-каталоги openclaw (включая profiles)
 - маркерный блок NMC-AI.V1 PNPM в ~/.bashrc
 - tailscale serve publish для OpenClaw
 - временные runtime-файлы OpenClaw в /tmp/openclaw*
+- стерильный rebuild /home/openclaw до baseline infra (с сохранением ~/.ssh)
 - флаги openclaw_completed/openclaw_completed_at в state.json
 
 Что НЕ трогает:
@@ -178,15 +180,19 @@ cleanup_user_gateway_unit_files() {
 
   log "Удаление файлов user-unit OpenClaw (включая stale fallback)"
   run_root find "${OPENCLAW_HOME}/.config/systemd/user" -maxdepth 1 -type f \
-    \( -name 'openclaw-gateway*.service' -o -name '*openclaw*gateway*.service' -o -name '*openclaw*.service' \) \
+    \( -name 'openclaw-gateway*.service*' -o -name '*openclaw*gateway*.service*' -o -name '*openclaw*.service*' \) \
     -delete 2>/dev/null || true
 
   run_root find "${OPENCLAW_HOME}/.config/systemd/user/default.target.wants" -maxdepth 1 -type l \
-    \( -name 'openclaw-gateway*.service' -o -name '*openclaw*gateway*.service' -o -name '*openclaw*.service' \) \
+    \( -name 'openclaw-gateway*.service*' -o -name '*openclaw*gateway*.service*' -o -name '*openclaw*.service*' \) \
     -delete 2>/dev/null || true
 
   run_root find "${OPENCLAW_HOME}/.config/systemd/user/multi-user.target.wants" -maxdepth 1 -type l \
-    \( -name 'openclaw-gateway*.service' -o -name '*openclaw*gateway*.service' -o -name '*openclaw*.service' \) \
+    \( -name 'openclaw-gateway*.service*' -o -name '*openclaw*gateway*.service*' -o -name '*openclaw*.service*' \) \
+    -delete 2>/dev/null || true
+
+  run_root find "${OPENCLAW_HOME}/.config/systemd/user/graphical-session.target.wants" -maxdepth 1 -type l \
+    \( -name 'openclaw-gateway*.service*' -o -name '*openclaw*gateway*.service*' -o -name '*openclaw*.service*' \) \
     -delete 2>/dev/null || true
 }
 
@@ -217,6 +223,7 @@ stop_orphan_gateway_processes() {
 
   run_root pkill -u openclaw -f 'openclaw-gateway' || true
   run_root pkill -u openclaw -f 'openclaw gateway' || true
+  run_root pkill -u openclaw -f 'node .*openclaw.*dist/index.js.*gateway' || true
 
   if (( DRY_RUN )); then
     printf '[dry-run] kill listeners on tcp:18789 (if any)\n'
@@ -227,9 +234,20 @@ stop_orphan_gateway_processes() {
       while IFS= read -r pid; do
         [[ -z "${pid}" ]] && continue
         run_root kill -TERM "${pid}" || true
+        sleep 0.2
+        run_root kill -KILL "${pid}" || true
       done <<< "${pids}"
     fi
   fi
+}
+
+run_official_openclaw_uninstall() {
+  if ! openclaw_user_exists; then
+    return 0
+  fi
+
+  log "Официальный OpenClaw uninstall --all (если команда доступна)"
+  run_as_openclaw 'export PNPM_HOME="$HOME/.local/share/pnpm"; export NPM_CONFIG_PREFIX="$HOME/.npm-global"; export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH"; if ! command -v openclaw >/dev/null 2>&1; then exit 0; fi; HELP="$(openclaw uninstall --help 2>&1 || true)"; if [[ -z "$HELP" ]]; then exit 0; fi; if printf "%s" "$HELP" | grep -q -- "--all"; then openclaw uninstall --all --yes --non-interactive >/dev/null 2>&1 || openclaw uninstall --all --yes >/dev/null 2>&1 || printf "yes\n" | openclaw uninstall --all >/dev/null 2>&1 || true; fi; openclaw gateway uninstall >/dev/null 2>&1 || true' || true
 }
 
 reset_tailscale_serve() {
@@ -264,6 +282,15 @@ remove_openclaw_packages() {
   run_root bash -lc "find '${OPENCLAW_HOME}/.local/share/pnpm' -type d -name openclaw 2>/dev/null | grep '/node_modules/openclaw$' | xargs -r rm -rf" || true
 }
 
+remove_root_openclaw_packages() {
+  log "Удаление root-level инсталляции openclaw (если есть)"
+
+  run_root bash -lc 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; npm uninstall -g openclaw >/dev/null 2>&1 || true; pnpm remove -g openclaw >/dev/null 2>&1 || true' || true
+
+  run_root rm -f /usr/local/bin/openclaw /usr/local/bin/claw /usr/bin/openclaw /usr/bin/claw || true
+  run_root rm -rf /usr/local/lib/node_modules/openclaw /usr/lib/node_modules/openclaw || true
+}
+
 remove_openclaw_data() {
   if ! openclaw_user_exists; then
     return 0
@@ -271,6 +298,17 @@ remove_openclaw_data() {
 
   log "Удаление данных/конфига OpenClaw"
   run_root rm -rf "${OPENCLAW_HOME}/.openclaw" || true
+  run_root rm -rf "${OPENCLAW_HOME}/.openclaw-"* || true
+  run_root rm -rf "${OPENCLAW_HOME}/.config/openclaw" || true
+  run_root rm -rf "${OPENCLAW_HOME}/.config/openclaw-"* || true
+  run_root rm -rf "${OPENCLAW_HOME}/.cache/openclaw" || true
+  run_root rm -rf "${OPENCLAW_HOME}/.cache/openclaw-"* || true
+  run_root rm -rf "${OPENCLAW_HOME}/.local/state/openclaw" || true
+  run_root rm -rf "${OPENCLAW_HOME}/.local/state/openclaw-"* || true
+  run_root rm -rf "${OPENCLAW_HOME}/.local/share/openclaw" || true
+  run_root rm -rf "${OPENCLAW_HOME}/.local/share/openclaw-"* || true
+
+  run_as_openclaw 'export PNPM_HOME="$HOME/.local/share/pnpm"; export NPM_CONFIG_PREFIX="$HOME/.npm-global"; export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH"; npm config delete prefix || true; pnpm config delete global-dir || true; pnpm config delete global-bin-dir || true' || true
 
   if (( DRY_RUN )); then
     printf '[dry-run] remove block NMC-AI.V1 PNPM from %s/.bashrc\n' "$OPENCLAW_HOME"
@@ -301,6 +339,42 @@ path.write_text(("\n".join(out).rstrip("\n") + "\n") if out else "")
 PY
     run_root chown openclaw:openclaw "${OPENCLAW_HOME}/.bashrc" || true
   fi
+}
+
+rebuild_openclaw_home_baseline() {
+  if ! openclaw_user_exists; then
+    return 0
+  fi
+
+  log "Стерильный rebuild /home/openclaw до baseline infra (с сохранением ~/.ssh)"
+
+  run_root install -d -m 0755 -o openclaw -g openclaw "${OPENCLAW_HOME}"
+
+  if (( DRY_RUN )); then
+    printf '[dry-run] prune %s except .ssh\n' "$OPENCLAW_HOME"
+  else
+    run_root find "${OPENCLAW_HOME}" -mindepth 1 -maxdepth 1 ! -name '.ssh' -exec rm -rf {} + || true
+  fi
+
+  if (( DRY_RUN )); then
+    printf '[dry-run] restore baseline dotfiles from /etc/skel (.bashrc .profile .bash_logout)\n'
+  else
+    local dot
+    for dot in .bashrc .profile .bash_logout; do
+      if run_root test -f "/etc/skel/${dot}"; then
+        run_root install -m 0644 -o openclaw -g openclaw "/etc/skel/${dot}" "${OPENCLAW_HOME}/${dot}"
+      else
+        run_root touch "${OPENCLAW_HOME}/${dot}"
+        run_root chown openclaw:openclaw "${OPENCLAW_HOME}/${dot}"
+        run_root chmod 0644 "${OPENCLAW_HOME}/${dot}"
+      fi
+    done
+  fi
+
+  run_root install -d -m 0700 -o openclaw -g openclaw "${OPENCLAW_HOME}/.ssh"
+  run_root chown -R openclaw:openclaw "${OPENCLAW_HOME}/.ssh" || true
+  run_root chmod 0700 "${OPENCLAW_HOME}/.ssh" || true
+  run_root chmod 0600 "${OPENCLAW_HOME}/.ssh/authorized_keys" || true
 }
 
 clear_openclaw_state_flags() {
@@ -365,10 +439,13 @@ main() {
   cleanup_user_gateway_unit_files
   remove_system_gateway_fallback_unit
   stop_orphan_gateway_processes
+  run_official_openclaw_uninstall
   remove_openclaw_packages
+  remove_root_openclaw_packages
   remove_openclaw_data
   reset_tailscale_serve
   cleanup_tmp_runtime
+  rebuild_openclaw_home_baseline
   clear_openclaw_state_flags
 
   log "Сброс второго этапа завершен"

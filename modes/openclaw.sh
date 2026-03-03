@@ -167,7 +167,7 @@ verify_openclaw_binary() {
 
 openclaw_onboard_supports_flag() {
   local flag="$1"
-  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" onboard --help 2>/dev/null | grep -q -- '$flag'"; then
+  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" onboard --help 2>/dev/null | grep -q -- \"$flag\""; then
     return 0
   fi
   return 1
@@ -527,7 +527,7 @@ harden_openclaw_state_permissions() {
 
 openclaw_doctor_supports_flag() {
   local flag="$1"
-  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --help 2>/dev/null | grep -q -- '$flag'"; then
+  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --help 2>/dev/null | grep -q -- \"$flag\""; then
     return 0
   fi
   return 1
@@ -546,36 +546,110 @@ restart_openclaw_gateway_service_unit() {
   run_sudo systemctl restart "$OPENCLAW_GATEWAY_UNIT"
 }
 
-attempt_openclaw_doctor_repair() {
-  if ! openclaw_doctor_supports_flag "--repair"; then
+openclaw_gateway_service_path() {
+  printf '%s' "/home/openclaw/.local/share/pnpm:/home/openclaw/.npm-global/bin:/home/openclaw/.local/bin:/home/openclaw/bin:/home/openclaw/.volta/bin:/home/openclaw/.asdf/shims:/home/openclaw/.bun/bin:/home/openclaw/.nvm/current/bin:/home/openclaw/.fnm/current/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+}
+
+read_openclaw_gateway_token() {
+  run_sudo python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("/home/openclaw/.openclaw/openclaw.json")
+if not path.exists():
+    raise SystemExit(0)
+
+try:
+    cfg = json.loads(path.read_text() or "{}")
+except json.JSONDecodeError:
+    raise SystemExit(0)
+
+gateway = cfg.get("gateway")
+if not isinstance(gateway, dict):
+    raise SystemExit(0)
+
+auth = gateway.get("auth")
+if not isinstance(auth, dict):
+    raise SystemExit(0)
+
+token = auth.get("token")
+if isinstance(token, str) and token.strip():
+    print(token.strip())
+PY
+}
+
+openclaw_gateway_execstart() {
+  local resolved
+  resolved="$(run_as_openclaw "${OPENCLAW_ENV_EXPORTS} readlink -f \"${OPENCLAW_BIN_PATH}\" 2>/dev/null || true" | tail -n1 | tr -d '\r')"
+  if [[ -n "$resolved" && "$resolved" == *.js ]]; then
+    printf '/usr/bin/node %s gateway --port %s' "$resolved" "$OPENCLAW_GATEWAY_PORT"
+    return 0
+  fi
+
+  printf '%s gateway --port %s' "$OPENCLAW_BIN_PATH" "$OPENCLAW_GATEWAY_PORT"
+}
+
+list_openclaw_gateway_user_units() {
+  openclaw_systemctl_user list-unit-files --type=service --no-legend 2>/dev/null \
+    | awk '{print $1}' \
+    | grep -E '^openclaw-gateway.*\.service$' \
+    | sort -u || true
+}
+
+detect_openclaw_gateway_unit() {
+  local unit
+  unit="$(list_openclaw_gateway_user_units | head -n1 || true)"
+  if [[ -z "$unit" ]]; then
     return 1
   fi
 
-  local cmd="${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --repair"
-  local has_non_prompt_flag=0
-
-  if openclaw_doctor_supports_flag "--yes"; then
-    cmd+=" --yes"
-    has_non_prompt_flag=1
-  elif openclaw_doctor_supports_flag "--non-interactive"; then
-    cmd+=" --non-interactive"
-    has_non_prompt_flag=1
-  fi
-
-  # Не запускаем doctor --repair с потенциальными интерактивными вопросами.
-  if [[ "${has_non_prompt_flag}" -ne 1 ]]; then
-    return 1
-  fi
-
-  if ! run_as_openclaw "$cmd"; then
-    return 1
-  fi
-
-  if ! restart_openclaw_gateway_service_unit; then
-    return 1
-  fi
-
+  OPENCLAW_GATEWAY_UNIT="$unit"
   return 0
+}
+
+openclaw_devices_approve_supports_flag() {
+  local flag="$1"
+  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" devices approve --help 2>/dev/null | grep -q -- \"$flag\""; then
+    return 0
+  fi
+  return 1
+}
+
+attempt_openclaw_pairing_repair() {
+  log_warn "gateway probe вернул pairing required. Пытаюсь auto-approve pending devices."
+  local base_cmd="${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" devices approve --all"
+
+  if openclaw_devices_approve_supports_flag "--yes"; then
+    if run_as_openclaw "${base_cmd} --yes"; then
+      return 0
+    fi
+  fi
+
+  if openclaw_devices_approve_supports_flag "--non-interactive"; then
+    if run_as_openclaw "${base_cmd} --non-interactive"; then
+      return 0
+    fi
+  fi
+
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} printf 'yes\n' | \"${OPENCLAW_BIN_PATH}\" devices approve --all"
+}
+
+attempt_openclaw_gateway_service_repair() {
+  log_warn "Пробую repair через openclaw gateway install --force"
+
+  if ! run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway install --force"; then
+    log_warn "gateway install --force вернул ошибку; продолжаю с проверкой unit вручную"
+  fi
+
+  if [[ "${OPENCLAW_SERVICE_SCOPE}" == "user" ]]; then
+    if ! detect_openclaw_gateway_unit; then
+      return 1
+    fi
+    openclaw_systemctl_user daemon-reload || true
+    openclaw_systemctl_user enable "$OPENCLAW_GATEWAY_UNIT" || true
+  fi
+
+  restart_openclaw_gateway_service_unit
 }
 
 install_user_gateway_service_fallback() {
@@ -586,7 +660,13 @@ install_user_gateway_service_fallback() {
 
   local unit_path="/home/openclaw/.config/systemd/user/${OPENCLAW_GATEWAY_UNIT}"
   local unit_tmp
+  local service_path
+  local gateway_token
+  local exec_start
   unit_tmp="$(mktemp)"
+  service_path="$(openclaw_gateway_service_path)"
+  gateway_token="$(read_openclaw_gateway_token)"
+  exec_start="$(openclaw_gateway_execstart)"
 
   cat > "$unit_tmp" <<EOF
 [Unit]
@@ -598,8 +678,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/openclaw
 Environment=HOME=/home/openclaw
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=${OPENCLAW_BIN_PATH} gateway --port ${OPENCLAW_GATEWAY_PORT}
+Environment=PATH=${service_path}
+Environment=OPENCLAW_GATEWAY_PORT=${OPENCLAW_GATEWAY_PORT}
+Environment=OPENCLAW_CONFIG=/home/openclaw/.openclaw/openclaw.json
+${gateway_token:+Environment=OPENCLAW_GATEWAY_TOKEN=${gateway_token}}
+ExecStart=${exec_start}
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -637,7 +720,13 @@ install_system_gateway_service_fallback() {
   OPENCLAW_GATEWAY_UNIT="openclaw-gateway-host.service"
 
   local unit_tmp
+  local service_path
+  local gateway_token
+  local exec_start
   unit_tmp="$(mktemp)"
+  service_path="$(openclaw_gateway_service_path)"
+  gateway_token="$(read_openclaw_gateway_token)"
+  exec_start="$(openclaw_gateway_execstart)"
 
   cat > "$unit_tmp" <<EOF
 [Unit]
@@ -651,8 +740,11 @@ User=openclaw
 Group=openclaw
 WorkingDirectory=/home/openclaw
 Environment=HOME=/home/openclaw
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=${OPENCLAW_BIN_PATH} gateway --port ${OPENCLAW_GATEWAY_PORT}
+Environment=PATH=${service_path}
+Environment=OPENCLAW_GATEWAY_PORT=${OPENCLAW_GATEWAY_PORT}
+Environment=OPENCLAW_CONFIG=/home/openclaw/.openclaw/openclaw.json
+${gateway_token:+Environment=OPENCLAW_GATEWAY_TOKEN=${gateway_token}}
+ExecStart=${exec_start}
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -683,40 +775,33 @@ install_and_start_gateway_service() {
   fi
 
   OPENCLAW_SERVICE_SCOPE="user"
-
+  local install_failed=0
   if ! run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway install --force"; then
-    if install_user_gateway_service_fallback; then
-      return 0
-    fi
-    install_system_gateway_service_fallback
-    return 0
+    install_failed=1
+    log_warn "gateway install --force вернул ошибку; проверяю фактический статус user-unit"
   fi
 
-  local unit
-  unit="$(openclaw_systemctl_user list-unit-files --type=service --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^openclaw-gateway.*\\.service$' | head -n1 || true)"
-  if [[ -z "$unit" ]]; then
-    log_warn "После gateway install не найден unit openclaw-gateway*.service"
-    if install_user_gateway_service_fallback; then
+  if detect_openclaw_gateway_unit; then
+    openclaw_systemctl_user daemon-reload || true
+    openclaw_systemctl_user enable "$OPENCLAW_GATEWAY_UNIT" || true
+
+    if openclaw_systemctl_user restart "$OPENCLAW_GATEWAY_UNIT" && openclaw_systemctl_user is-active "$OPENCLAW_GATEWAY_UNIT" >/dev/null 2>&1; then
+      if [[ "$install_failed" -eq 1 ]]; then
+        log_warn "gateway install вернул ошибку, но unit активен; продолжаю"
+      fi
       return 0
     fi
-    install_system_gateway_service_fallback
-    return 0
-  fi
 
-  OPENCLAW_GATEWAY_UNIT="$unit"
-
-  openclaw_systemctl_user daemon-reload
-  openclaw_systemctl_user enable "$OPENCLAW_GATEWAY_UNIT"
-  openclaw_systemctl_user restart "$OPENCLAW_GATEWAY_UNIT"
-
-  if ! openclaw_systemctl_user is-active "$OPENCLAW_GATEWAY_UNIT" >/dev/null 2>&1; then
     openclaw_systemctl_user status "$OPENCLAW_GATEWAY_UNIT" --no-pager || true
-    if install_user_gateway_service_fallback; then
-      return 0
-    fi
-    install_system_gateway_service_fallback
+  else
+    log_warn "После gateway install не найден unit openclaw-gateway*.service"
+  fi
+
+  if install_user_gateway_service_fallback; then
     return 0
   fi
+
+  install_system_gateway_service_fallback
 }
 
 configure_tailscale_https_endpoint() {
@@ -750,7 +835,8 @@ wait_for_gateway_probe() {
   log_info "Проверка доступности gateway"
 
   local attempt
-  local repaired=0
+  local pairing_repaired=0
+  local service_repaired=0
   local last_probe_error=""
   for attempt in $(seq 1 30); do
     local probe_output
@@ -761,10 +847,31 @@ wait_for_gateway_probe() {
 
     last_probe_error="$probe_output"
 
-    if [[ "$repaired" -eq 0 ]] && printf '%s' "$probe_output" | grep -qi 'pairing required'; then
-      log_warn "gateway probe вернул pairing required. Выполняю doctor --repair и рестарт сервиса."
-      repaired=1
-      if attempt_openclaw_doctor_repair; then
+    if printf '%s' "$probe_output" | grep -qi 'pairing required'; then
+      if [[ "$pairing_repaired" -eq 0 ]]; then
+        pairing_repaired=1
+        if attempt_openclaw_pairing_repair; then
+          sleep 1
+          continue
+        fi
+      fi
+
+      if [[ "$service_repaired" -eq 0 ]]; then
+        service_repaired=1
+        if attempt_openclaw_gateway_service_repair; then
+          sleep 1
+          continue
+        fi
+      fi
+
+      sleep 2
+      continue
+    fi
+
+    if [[ "$service_repaired" -eq 0 ]]; then
+      service_repaired=1
+      if attempt_openclaw_gateway_service_repair; then
+        sleep 1
         continue
       fi
     fi

@@ -20,6 +20,7 @@
 - `openclaw onboard --install-daemon` + форс `gateway.bind=loopback`
 - форс `gateway.tailscale.mode=serve` (tailnet HTTPS URL)
 - обязательный запуск gateway через `openclaw-gateway*.service` (или fallback `openclaw-gateway-host.service`, если user-systemd недоступен)
+- авто-repair сервиса через `openclaw gateway install --force` и auto-approve pending devices при `pairing required`
 - health checks (`openclaw status`, `openclaw doctor`, `openclaw gateway probe`)
 
 ## Быстрый старт
@@ -48,10 +49,12 @@ chmod +x ./reset-openclaw-stage.sh
 ./reset-openclaw-stage.sh
 ```
 
-Скрипт сброса удаляет user-units OpenClaw, system fallback unit `openclaw-gateway-host.service`,
-гасит orphan `gateway` процессы (включая очистку порта `18789`), удаляет `~/.openclaw`,
-установленные `openclaw` бинарники, временные runtime-файлы `/tmp/openclaw*` и сбрасывает
-`tailscale serve` publish из второго этапа.
+Скрипт сброса сначала пытается выполнить официальный `openclaw uninstall --all` (non-interactive),
+после чего удаляет user-units OpenClaw, system fallback unit `openclaw-gateway-host.service`,
+гасит orphan `gateway` процессы (включая очистку порта `18789`), удаляет `~/.openclaw*` и XDG
+каталоги OpenClaw, чистит user/root npm/pnpm инсталляцию OpenClaw, временные runtime-файлы
+`/tmp/openclaw*`, сбрасывает `tailscale serve` publish и выполняет стерильный rebuild
+`/home/openclaw` до baseline infra (с сохранением `~/.ssh`).
 
 Полезные режимы:
 
