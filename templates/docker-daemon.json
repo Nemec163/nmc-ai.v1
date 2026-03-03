@@ -1,0 +1,11 @@
+{
+  "iptables": true,
+  "ip6tables": false,
+  "live-restore": true,
+  "userland-proxy": false,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}

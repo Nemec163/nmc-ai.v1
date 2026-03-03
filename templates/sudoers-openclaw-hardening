@@ -1,0 +1,4 @@
+Defaults:openclaw passwd_tries=3
+Defaults:openclaw timestamp_timeout=10
+Defaults:openclaw timestamp_type=tty
+Defaults:openclaw use_pty
