@@ -368,6 +368,33 @@ ensure_openclaw_user_systemd_layout() {
   run_sudo chown openclaw:openclaw /home/openclaw/.config /home/openclaw/.config/systemd /home/openclaw/.config/systemd/user
 }
 
+resolve_openclaw_control_ui_allowed_origins() {
+  local dns=""
+  local serve_urls=""
+  local extra=""
+
+  dns="${OPENCLAW_TAILNET_DNS:-}"
+  if [[ -z "$dns" ]]; then
+    dns="$(tailscale_dns_name || true)"
+  fi
+
+  serve_urls="$(run_sudo tailscale serve status 2>/dev/null | grep -Eo 'https?://[^[:space:]]+' || true)"
+  extra="${OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS:-}"
+
+  {
+    [[ -n "$dns" ]] && printf 'https://%s\n' "$dns"
+    [[ -n "$serve_urls" ]] && printf '%s\n' "$serve_urls"
+    printf 'http://127.0.0.1:%s\n' "$OPENCLAW_GATEWAY_PORT"
+    printf 'http://localhost:%s\n' "$OPENCLAW_GATEWAY_PORT"
+    if [[ -n "$extra" ]]; then
+      printf '%s\n' "$extra" | tr ',;' '\n'
+    fi
+  } \
+    | sed -E 's#^(https?://[^/]+).*$#\1#' \
+    | sed -E 's#/+$##' \
+    | awk 'BEGIN{IGNORECASE=1} NF{key=tolower($0); if(!seen[key]++){print}}'
+}
+
 ensure_openclaw_gateway_config() {
   log_info "Приведение gateway конфигурации к tailnet-only (loopback + tailscale serve)"
 
@@ -382,18 +409,23 @@ ensure_openclaw_gateway_config() {
     return 0
   fi
 
-  local dns="${OPENCLAW_TAILNET_DNS:-}"
+  local allowed_origins
+  allowed_origins="$(resolve_openclaw_control_ui_allowed_origins)"
+  if [[ -z "$allowed_origins" ]]; then
+    log_warn "Не удалось определить allowedOrigins для Control UI автоматически"
+  fi
 
-  run_sudo python3 - "$config_path" "$OPENCLAW_GATEWAY_PORT" "$OPENCLAW_TAILSCALE_MODE" "$dns" <<'PY'
+  run_sudo python3 - "$config_path" "$OPENCLAW_GATEWAY_PORT" "$OPENCLAW_TAILSCALE_MODE" "$allowed_origins" <<'PY'
 import json
 import pathlib
 import re
 import sys
+from urllib.parse import urlsplit
 
 path = pathlib.Path(sys.argv[1])
 port = int(sys.argv[2])
 mode = sys.argv[3]
-dns = sys.argv[4].strip()
+origins_blob = sys.argv[4]
 
 raw = path.read_text()
 cfg = json.loads(raw if raw.strip() else "{}")
@@ -490,18 +522,48 @@ if isinstance(deny_commands, list):
         nodes["denyCommands"] = sanitized
         gateway["nodes"] = nodes
 
-if dns:
-    origin = f"https://{dns}"
-    control_ui = gateway.get("controlUi")
-    if not isinstance(control_ui, dict):
-        control_ui = {}
-    allowed = control_ui.get("allowedOrigins")
-    if not isinstance(allowed, list):
-        allowed = []
-    if origin.lower() not in {str(x).lower() for x in allowed}:
-        allowed.append(origin)
-    control_ui["allowedOrigins"] = allowed
-    gateway["controlUi"] = control_ui
+control_ui = gateway.get("controlUi")
+if not isinstance(control_ui, dict):
+    control_ui = {}
+
+allowed = control_ui.get("allowedOrigins")
+if not isinstance(allowed, list):
+    allowed = []
+
+def normalize_origin(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parsed = urlsplit(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+merged = []
+seen = set()
+
+for item in allowed:
+    normalized = normalize_origin(item)
+    if not normalized:
+        continue
+    key = normalized.lower()
+    if key in seen:
+        continue
+    seen.add(key)
+    merged.append(normalized)
+
+for line in origins_blob.splitlines():
+    normalized = normalize_origin(line)
+    if not normalized:
+        continue
+    key = normalized.lower()
+    if key in seen:
+        continue
+    seen.add(key)
+    merged.append(normalized)
+
+control_ui["allowedOrigins"] = merged
+gateway["controlUi"] = control_ui
 
 cfg["gateway"] = gateway
 
@@ -947,10 +1009,15 @@ run_openclaw_mode() {
   ensure_openclaw_gateway_config
   harden_openclaw_state_permissions
   install_and_start_gateway_service
+  ensure_openclaw_gateway_config
+  restart_openclaw_gateway_service_unit || true
   wait_for_gateway_probe
   ensure_tailscale_https_firewall_rule
   configure_tailscale_https_endpoint
   run_openclaw_health_checks
+  ensure_openclaw_gateway_config
+  restart_openclaw_gateway_service_unit || true
+  wait_for_gateway_probe
 
   state_set_bool openclaw_completed true
   state_set_string openclaw_completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
