@@ -817,6 +817,20 @@ configure_tailscale_https_endpoint() {
   OPENCLAW_TAILNET_DNS="$(tailscale_dns_name)"
 }
 
+ensure_tailscale_https_firewall_rule() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! run_sudo ufw status >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log_info "Разрешение HTTPS (443/tcp) на tailscale0 для OpenClaw UI"
+  run_sudo ufw allow in on tailscale0 to any port 443 proto tcp comment 'OpenClaw UI via Tailscale' || true
+  run_sudo ufw reload || true
+}
+
 wait_for_gateway_probe() {
   log_info "Проверка доступности gateway"
 
@@ -923,6 +937,7 @@ run_openclaw_mode() {
   harden_openclaw_state_permissions
   install_and_start_gateway_service
   wait_for_gateway_probe
+  ensure_tailscale_https_firewall_rule
   configure_tailscale_https_endpoint
   run_openclaw_health_checks
 
