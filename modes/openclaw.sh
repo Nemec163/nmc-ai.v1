@@ -6,7 +6,7 @@ ensure_openclaw_preflight() {
   log_info "Проверка preflight (openclaw)"
 
   if [[ "$EUID" -eq 0 ]]; then
-    fatal 10 "Запускайте скрипт от обычного sudo-пользователя, не от root"
+    log_warn "Запуск от root разрешен (bootstrap режим)."
   fi
 
   if ! supported_ubuntu; then

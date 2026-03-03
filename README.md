@@ -70,7 +70,8 @@ cp installer.env.example installer.env
 
 ## Важные замечания
 
-- Скрипт запускается от обычного sudo-пользователя, не от `root` shell.
+- Скрипт можно запускать от `root` или от обычного sudo-пользователя.
 - После `infra` публичный SSH закрывается; доступ только через Tailscale.
+- Root вход по SSH остаётся разрешён только по ключу (`PermitRootLogin prohibit-password`).
 - Docker sandbox OpenClaw специально не настраивается (по policy проекта).
 - Права `sudo` у `openclaw` требуют пароль; `NOPASSWD` не используется.

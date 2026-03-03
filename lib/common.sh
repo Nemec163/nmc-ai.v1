@@ -58,6 +58,10 @@ ensure_sudo_access() {
     return 0
   fi
 
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    return 0
+  fi
+
   if ! command -v sudo >/dev/null 2>&1; then
     log_error "Требуется sudo, но команда sudo не найдена"
     return 1
@@ -79,18 +83,34 @@ run_cmd() {
 
 run_sudo() {
   if (( DRY_RUN )); then
-    log_info "[dry-run] sudo $*"
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+      log_info "[dry-run] $*"
+    else
+      log_info "[dry-run] sudo $*"
+    fi
     return 0
   fi
-  sudo "$@"
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
 }
 
 run_sudo_quiet() {
   if (( DRY_RUN )); then
-    log_info "[dry-run] sudo (quiet) $*"
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+      log_info "[dry-run] (quiet) $*"
+    else
+      log_info "[dry-run] sudo (quiet) $*"
+    fi
     return 0
   fi
-  sudo "$@" >/dev/null 2>&1
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@" >/dev/null 2>&1
+  else
+    sudo "$@" >/dev/null 2>&1
+  fi
 }
 
 run_as_openclaw() {
@@ -99,7 +119,11 @@ run_as_openclaw() {
     log_info "[dry-run] sudo -iu openclaw bash -lc '$cmd'"
     return 0
   fi
-  sudo -iu openclaw bash -lc "$cmd"
+  if command -v sudo >/dev/null 2>&1; then
+    run_sudo -iu openclaw bash -lc "$cmd"
+  else
+    printf '%s\n' "$cmd" | su - openclaw -s /bin/bash -c 'bash -se'
+  fi
 }
 
 run_as_openclaw_sensitive() {
@@ -108,7 +132,11 @@ run_as_openclaw_sensitive() {
     log_info "[dry-run] sudo -iu openclaw bash -lc '<sensitive command>'"
     return 0
   fi
-  sudo -iu openclaw bash -lc "$cmd"
+  if command -v sudo >/dev/null 2>&1; then
+    run_sudo -iu openclaw bash -lc "$cmd"
+  else
+    printf '%s\n' "$cmd" | su - openclaw -s /bin/bash -c 'bash -se'
+  fi
 }
 
 fatal() {
@@ -150,7 +178,7 @@ ensure_block_in_file() {
   tmp_block="$(mktemp)"
   printf '%s\n' "$block_content" > "$tmp_block"
 
-  sudo python3 - "$file" "$marker" "$insert_before_regex" "$tmp_block" <<'PY'
+  run_sudo python3 - "$file" "$marker" "$insert_before_regex" "$tmp_block" <<'PY'
 import pathlib
 import re
 import sys

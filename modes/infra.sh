@@ -25,7 +25,7 @@ ensure_infra_preflight() {
   log_info "Проверка preflight (infra)"
 
   if [[ "$EUID" -eq 0 ]]; then
-    fatal 10 "Запускайте скрипт от обычного sudo-пользователя, не от root"
+    log_warn "Запуск от root разрешен (bootstrap режим). Root SSH будет оставлен только по ключу."
   fi
 
   if ! supported_ubuntu; then
