@@ -6,12 +6,14 @@ prompt_text_ru() {
   local value=""
 
   if [[ -n "$default_value" ]]; then
-    read -r -p "$prompt [$default_value]: " value
+    printf "%s [%s]: " "$prompt" "$default_value" > /dev/tty
+    IFS= read -r value < /dev/tty || true
     if [[ -z "$value" ]]; then
       value="$default_value"
     fi
   else
-    read -r -p "$prompt: " value
+    printf "%s: " "$prompt" > /dev/tty
+    IFS= read -r value < /dev/tty || true
   fi
   printf '%s' "$value"
 }
@@ -22,10 +24,12 @@ prompt_secret_confirm_ru() {
   local v2=""
 
   while true; do
-    read -r -s -p "$prompt: " v1
-    printf '\n'
-    read -r -s -p "Повторите ввод: " v2
-    printf '\n'
+    printf "%s: " "$prompt" > /dev/tty
+    IFS= read -r -s v1 < /dev/tty || true
+    printf '\n' > /dev/tty
+    printf "Повторите ввод: " > /dev/tty
+    IFS= read -r -s v2 < /dev/tty || true
+    printf '\n' > /dev/tty
 
     if [[ -z "$v1" ]]; then
       log_warn "Значение не может быть пустым."
@@ -49,14 +53,15 @@ prompt_choice_ru() {
   local idx=1
   local ans
 
-  printf "%s\n" "$prompt"
+  printf "%s\n" "$prompt" > /dev/tty
   for opt in "${options[@]}"; do
-    printf "  %d) %s\n" "$idx" "$opt"
+    printf "  %d) %s\n" "$idx" "$opt" > /dev/tty
     idx=$((idx + 1))
   done
 
   while true; do
-    read -r -p "Выберите номер: " ans
+    printf "Выберите номер: " > /dev/tty
+    IFS= read -r ans < /dev/tty || true
     if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#options[@]} )); then
       printf '%s' "${options[$((ans - 1))]}"
       return 0
