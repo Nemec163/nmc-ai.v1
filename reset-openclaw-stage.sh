@@ -12,10 +12,12 @@ reset-openclaw-stage.sh — полный сброс только второго 
 
 Что удаляет:
 - user systemd units OpenClaw у пользователя openclaw
+- system-level fallback unit openclaw-gateway-host.service
 - установленный openclaw (npm/pnpm global)
 - бинарники openclaw в ~/.local/bin и ~/.npm-global/bin
 - конфиг/данные ~/.openclaw
 - маркерный блок NMC-AI.V1 PNPM в ~/.bashrc
+- tailscale serve publish для OpenClaw
 - флаги openclaw_completed/openclaw_completed_at в state.json
 
 Что НЕ трогает:
@@ -50,7 +52,8 @@ run_root() {
     return 0
   fi
 
-  if [[ "$EUID" -eq 0 ]]; then
+  # Keep support for sudo-style flags (`-iu user ...`) even in root shell.
+  if [[ "$EUID" -eq 0 && "${1:-}" != -* ]]; then
     "$@"
   else
     sudo "$@"
@@ -120,7 +123,7 @@ ensure_prereqs() {
 
 collect_openclaw_units() {
   local uid="$1"
-  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user list-unit-files --type=service --no-legend 2>/dev/null \
+  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user list-unit-files --type=service --no-legend 2>/dev/null \
     | awk '{print $1}' \
     | grep -Ei 'openclaw|claw' \
     | sort -u || true
@@ -141,8 +144,8 @@ stop_and_remove_openclaw_units() {
   if [[ -n "$units" ]]; then
     while IFS= read -r unit; do
       [[ -z "$unit" ]] && continue
-      run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user stop "$unit" || true
-      run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user disable "$unit" || true
+      run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user stop "$unit" || true
+      run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user disable "$unit" || true
       run_root rm -f "${OPENCLAW_HOME}/.config/systemd/user/${unit}" || true
       run_root rm -f "${OPENCLAW_HOME}/.config/systemd/user/default.target.wants/${unit}" || true
       run_root rm -f "${OPENCLAW_HOME}/.config/systemd/user/multi-user.target.wants/${unit}" || true
@@ -151,8 +154,29 @@ stop_and_remove_openclaw_units() {
     warn "User units OpenClaw не найдены"
   fi
 
-  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user daemon-reload || true
-  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" systemctl --user reset-failed || true
+  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user daemon-reload || true
+  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user reset-failed || true
+}
+
+remove_system_gateway_fallback_unit() {
+  log "Удаление system-level fallback unit OpenClaw"
+
+  run_root systemctl stop openclaw-gateway-host.service || true
+  run_root systemctl disable openclaw-gateway-host.service || true
+  run_root rm -f /etc/systemd/system/openclaw-gateway-host.service || true
+  run_root rm -f /etc/systemd/system/multi-user.target.wants/openclaw-gateway-host.service || true
+  run_root rm -f "${OPENCLAW_HOME}/.local/bin/openclaw-gateway-run.sh" || true
+  run_root systemctl daemon-reload || true
+  run_root systemctl reset-failed openclaw-gateway-host.service || true
+}
+
+reset_tailscale_serve() {
+  if ! command -v tailscale >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Сброс tailscale serve publish для OpenClaw"
+  run_root tailscale serve reset || true
 }
 
 remove_openclaw_packages() {
@@ -271,8 +295,10 @@ main() {
   confirm_reset
 
   stop_and_remove_openclaw_units
+  remove_system_gateway_fallback_unit
   remove_openclaw_packages
   remove_openclaw_data
+  reset_tailscale_serve
   clear_openclaw_state_flags
 
   log "Сброс второго этапа завершен"

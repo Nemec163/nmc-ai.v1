@@ -19,7 +19,7 @@
 - fallback на `pnpm install -g openclaw@latest`
 - `openclaw onboard --install-daemon` + форс `gateway.bind=loopback`
 - форс `gateway.tailscale.mode=serve` (tailnet HTTPS URL)
-- обязательная установка и запуск `openclaw-gateway*.service`
+- обязательный запуск gateway через `openclaw-gateway*.service` (или fallback `openclaw-gateway-host.service`, если user-systemd недоступен)
 - health checks (`openclaw status`, `openclaw doctor`, `openclaw gateway probe`)
 
 ## Быстрый старт
@@ -47,6 +47,9 @@ cp installer.env.example installer.env
 chmod +x ./reset-openclaw-stage.sh
 ./reset-openclaw-stage.sh
 ```
+
+Скрипт сброса удаляет user-units OpenClaw, system fallback unit `openclaw-gateway-host.service`,
+`~/.openclaw`, установленные `openclaw` бинарники и сбрасывает `tailscale serve` publish из второго этапа.
 
 Полезные режимы:
 
