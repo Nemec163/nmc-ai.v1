@@ -13,11 +13,13 @@ reset-openclaw-stage.sh — полный сброс только второго 
 Что удаляет:
 - user systemd units OpenClaw у пользователя openclaw
 - system-level fallback unit openclaw-gateway-host.service
+- orphan gateway-процессы и занятый порт 18789
 - установленный openclaw (npm/pnpm global)
 - бинарники openclaw в ~/.local/bin и ~/.npm-global/bin
 - конфиг/данные ~/.openclaw
 - маркерный блок NMC-AI.V1 PNPM в ~/.bashrc
 - tailscale serve publish для OpenClaw
+- временные runtime-файлы OpenClaw в /tmp/openclaw*
 - флаги openclaw_completed/openclaw_completed_at в state.json
 
 Что НЕ трогает:
@@ -91,6 +93,17 @@ openclaw_uid() {
   fi
 }
 
+run_openclaw_systemctl_user() {
+  local uid="$1"
+  shift
+
+  if run_root systemctl --machine "openclaw@" --user "$@" 2>/dev/null; then
+    return 0
+  fi
+
+  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user "$@" 2>/dev/null
+}
+
 confirm_reset() {
   if (( FORCE )); then
     return 0
@@ -123,7 +136,7 @@ ensure_prereqs() {
 
 collect_openclaw_units() {
   local uid="$1"
-  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user list-unit-files --type=service --no-legend 2>/dev/null \
+  run_openclaw_systemctl_user "$uid" list-unit-files --type=service --no-legend \
     | awk '{print $1}' \
     | grep -Ei 'openclaw|claw' \
     | sort -u || true
@@ -144,8 +157,8 @@ stop_and_remove_openclaw_units() {
   if [[ -n "$units" ]]; then
     while IFS= read -r unit; do
       [[ -z "$unit" ]] && continue
-      run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user stop "$unit" || true
-      run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user disable "$unit" || true
+      run_openclaw_systemctl_user "$uid" stop "$unit" || true
+      run_openclaw_systemctl_user "$uid" disable "$unit" || true
       run_root rm -f "${OPENCLAW_HOME}/.config/systemd/user/${unit}" || true
       run_root rm -f "${OPENCLAW_HOME}/.config/systemd/user/default.target.wants/${unit}" || true
       run_root rm -f "${OPENCLAW_HOME}/.config/systemd/user/multi-user.target.wants/${unit}" || true
@@ -154,8 +167,27 @@ stop_and_remove_openclaw_units() {
     warn "User units OpenClaw не найдены"
   fi
 
-  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user daemon-reload || true
-  run_root -iu openclaw env XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user reset-failed || true
+  run_openclaw_systemctl_user "$uid" daemon-reload || true
+  run_openclaw_systemctl_user "$uid" reset-failed || true
+}
+
+cleanup_user_gateway_unit_files() {
+  if ! openclaw_user_exists; then
+    return 0
+  fi
+
+  log "Удаление файлов user-unit OpenClaw (включая stale fallback)"
+  run_root find "${OPENCLAW_HOME}/.config/systemd/user" -maxdepth 1 -type f \
+    \( -name 'openclaw-gateway*.service' -o -name '*openclaw*gateway*.service' -o -name '*openclaw*.service' \) \
+    -delete 2>/dev/null || true
+
+  run_root find "${OPENCLAW_HOME}/.config/systemd/user/default.target.wants" -maxdepth 1 -type l \
+    \( -name 'openclaw-gateway*.service' -o -name '*openclaw*gateway*.service' -o -name '*openclaw*.service' \) \
+    -delete 2>/dev/null || true
+
+  run_root find "${OPENCLAW_HOME}/.config/systemd/user/multi-user.target.wants" -maxdepth 1 -type l \
+    \( -name 'openclaw-gateway*.service' -o -name '*openclaw*gateway*.service' -o -name '*openclaw*.service' \) \
+    -delete 2>/dev/null || true
 }
 
 remove_system_gateway_fallback_unit() {
@@ -163,11 +195,41 @@ remove_system_gateway_fallback_unit() {
 
   run_root systemctl stop openclaw-gateway-host.service || true
   run_root systemctl disable openclaw-gateway-host.service || true
+  run_root systemctl stop openclaw-gateway.service || true
+  run_root systemctl disable openclaw-gateway.service || true
   run_root rm -f /etc/systemd/system/openclaw-gateway-host.service || true
+  run_root rm -f /etc/systemd/system/openclaw-gateway.service || true
   run_root rm -f /etc/systemd/system/multi-user.target.wants/openclaw-gateway-host.service || true
+  run_root rm -f /etc/systemd/system/multi-user.target.wants/openclaw-gateway.service || true
   run_root rm -f "${OPENCLAW_HOME}/.local/bin/openclaw-gateway-run.sh" || true
   run_root systemctl daemon-reload || true
   run_root systemctl reset-failed openclaw-gateway-host.service || true
+  run_root systemctl reset-failed openclaw-gateway.service || true
+}
+
+stop_orphan_gateway_processes() {
+  if ! openclaw_user_exists; then
+    return 0
+  fi
+
+  log "Остановка orphan gateway процессов и освобождение порта 18789"
+  run_as_openclaw 'export PNPM_HOME="$HOME/.local/share/pnpm"; export NPM_CONFIG_PREFIX="$HOME/.npm-global"; export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH"; openclaw gateway stop || true'
+
+  run_root pkill -u openclaw -f 'openclaw-gateway' || true
+  run_root pkill -u openclaw -f 'openclaw gateway' || true
+
+  if (( DRY_RUN )); then
+    printf '[dry-run] kill listeners on tcp:18789 (if any)\n'
+  else
+    local pids
+    pids="$(run_root bash -lc "ss -ltnp '( sport = :18789 )' 2>/dev/null | sed -n 's/.*pid=\\([0-9]\\+\\).*/\\1/p' | sort -u")"
+    if [[ -n "${pids}" ]]; then
+      while IFS= read -r pid; do
+        [[ -z "${pid}" ]] && continue
+        run_root kill -TERM "${pid}" || true
+      done <<< "${pids}"
+    fi
+  fi
 }
 
 reset_tailscale_serve() {
@@ -177,6 +239,11 @@ reset_tailscale_serve() {
 
   log "Сброс tailscale serve publish для OpenClaw"
   run_root tailscale serve reset || true
+}
+
+cleanup_tmp_runtime() {
+  log "Удаление временных runtime-файлов OpenClaw (/tmp/openclaw*)"
+  run_root rm -rf /tmp/openclaw /tmp/openclaw-* || true
 }
 
 remove_openclaw_packages() {
@@ -295,10 +362,13 @@ main() {
   confirm_reset
 
   stop_and_remove_openclaw_units
+  cleanup_user_gateway_unit_files
   remove_system_gateway_fallback_unit
+  stop_orphan_gateway_processes
   remove_openclaw_packages
   remove_openclaw_data
   reset_tailscale_serve
+  cleanup_tmp_runtime
   clear_openclaw_state_flags
 
   log "Сброс второго этапа завершен"

@@ -525,33 +525,72 @@ harden_openclaw_state_permissions() {
   run_sudo chmod 600 /home/openclaw/.openclaw/openclaw.json || true
 }
 
+openclaw_doctor_supports_flag() {
+  local flag="$1"
+  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --help 2>/dev/null | grep -q -- '$flag'"; then
+    return 0
+  fi
+  return 1
+}
+
+restart_openclaw_gateway_service_unit() {
+  if [[ -z "${OPENCLAW_GATEWAY_UNIT:-}" ]]; then
+    return 1
+  fi
+
+  if [[ "${OPENCLAW_SERVICE_SCOPE}" == "user" ]]; then
+    openclaw_systemctl_user restart "$OPENCLAW_GATEWAY_UNIT"
+    return $?
+  fi
+
+  run_sudo systemctl restart "$OPENCLAW_GATEWAY_UNIT"
+}
+
+attempt_openclaw_doctor_repair() {
+  if ! openclaw_doctor_supports_flag "--repair"; then
+    return 1
+  fi
+
+  local cmd="${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --repair"
+  local has_non_prompt_flag=0
+
+  if openclaw_doctor_supports_flag "--yes"; then
+    cmd+=" --yes"
+    has_non_prompt_flag=1
+  elif openclaw_doctor_supports_flag "--non-interactive"; then
+    cmd+=" --non-interactive"
+    has_non_prompt_flag=1
+  fi
+
+  # Не запускаем doctor --repair с потенциальными интерактивными вопросами.
+  if [[ "${has_non_prompt_flag}" -ne 1 ]]; then
+    return 1
+  fi
+
+  if ! run_as_openclaw "$cmd"; then
+    return 1
+  fi
+
+  if ! restart_openclaw_gateway_service_unit; then
+    return 1
+  fi
+
+  return 0
+}
+
 install_user_gateway_service_fallback() {
   log_warn "gateway install через user-systemd завершился ошибкой, пробую ручной user-unit"
 
   OPENCLAW_SERVICE_SCOPE="user"
   OPENCLAW_GATEWAY_UNIT="openclaw-gateway.service"
 
-  local launch_script="/home/openclaw/.local/bin/openclaw-gateway-run.sh"
   local unit_path="/home/openclaw/.config/systemd/user/${OPENCLAW_GATEWAY_UNIT}"
   local unit_tmp
-  local launch_tmp
   unit_tmp="$(mktemp)"
-  launch_tmp="$(mktemp)"
-
-cat > "$launch_tmp" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-${OPENCLAW_ENV_EXPORTS}
-if "${OPENCLAW_BIN_PATH}" gateway run --help 2>/dev/null | grep -q -- '--allow-unconfigured'; then
-  exec "${OPENCLAW_BIN_PATH}" gateway run --allow-unconfigured
-else
-  exec "${OPENCLAW_BIN_PATH}" gateway run
-fi
-EOF
 
   cat > "$unit_tmp" <<EOF
 [Unit]
-Description=OpenClaw Gateway (manual user-unit fallback)
+Description=OpenClaw Gateway (manual user-unit fallback, port ${OPENCLAW_GATEWAY_PORT})
 After=network-online.target
 Wants=network-online.target
 
@@ -559,21 +598,20 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/openclaw
 Environment=HOME=/home/openclaw
-ExecStart=${launch_script}
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${OPENCLAW_BIN_PATH} gateway --port ${OPENCLAW_GATEWAY_PORT}
 Restart=always
-RestartSec=3
+RestartSec=5
 NoNewPrivileges=true
 
 [Install]
 WantedBy=default.target
 EOF
 
-  run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.local/bin
   run_sudo install -d -m 0755 -o openclaw -g openclaw /home/openclaw/.config/systemd/user
-  write_root_file "$launch_tmp" "$launch_script" 0755 openclaw openclaw
   write_root_file "$unit_tmp" "$unit_path" 0644 openclaw openclaw
 
-  rm -f "$unit_tmp" "$launch_tmp"
+  rm -f "$unit_tmp"
 
   if ! openclaw_systemctl_user daemon-reload; then
     return 1
@@ -598,22 +636,8 @@ install_system_gateway_service_fallback() {
   OPENCLAW_SERVICE_SCOPE="system"
   OPENCLAW_GATEWAY_UNIT="openclaw-gateway-host.service"
 
-  local launch_script="/home/openclaw/.local/bin/openclaw-gateway-run.sh"
   local unit_tmp
-  local launch_tmp
   unit_tmp="$(mktemp)"
-  launch_tmp="$(mktemp)"
-
-cat > "$launch_tmp" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-${OPENCLAW_ENV_EXPORTS}
-if "${OPENCLAW_BIN_PATH}" gateway run --help 2>/dev/null | grep -q -- '--allow-unconfigured'; then
-  exec "${OPENCLAW_BIN_PATH}" gateway run --allow-unconfigured
-else
-  exec "${OPENCLAW_BIN_PATH}" gateway run
-fi
-EOF
 
   cat > "$unit_tmp" <<EOF
 [Unit]
@@ -627,19 +651,19 @@ User=openclaw
 Group=openclaw
 WorkingDirectory=/home/openclaw
 Environment=HOME=/home/openclaw
-ExecStart=${launch_script}
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${OPENCLAW_BIN_PATH} gateway --port ${OPENCLAW_GATEWAY_PORT}
 Restart=always
-RestartSec=3
+RestartSec=5
 NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  write_root_file "$launch_tmp" "$launch_script" 0755 openclaw openclaw
   write_root_file "$unit_tmp" "/etc/systemd/system/${OPENCLAW_GATEWAY_UNIT}" 0644 root root
 
-  rm -f "$unit_tmp" "$launch_tmp"
+  rm -f "$unit_tmp"
 
   run_sudo systemctl daemon-reload
   run_sudo systemctl enable --now "${OPENCLAW_GATEWAY_UNIT}"
@@ -726,14 +750,31 @@ wait_for_gateway_probe() {
   log_info "Проверка доступности gateway"
 
   local attempt
+  local repaired=0
+  local last_probe_error=""
   for attempt in $(seq 1 30); do
-    if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway probe >/dev/null 2>&1"; then
+    local probe_output
+    if probe_output="$(run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway probe" 2>&1)"; then
       log_success "Gateway успешно отвечает на probe"
       return 0
     fi
+
+    last_probe_error="$probe_output"
+
+    if [[ "$repaired" -eq 0 ]] && printf '%s' "$probe_output" | grep -qi 'pairing required'; then
+      log_warn "gateway probe вернул pairing required. Выполняю doctor --repair и рестарт сервиса."
+      repaired=1
+      if attempt_openclaw_doctor_repair; then
+        continue
+      fi
+    fi
+
     sleep 2
   done
 
+  if [[ -n "$last_probe_error" ]]; then
+    log_warn "Последняя ошибка probe: ${last_probe_error}"
+  fi
   run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" gateway status --deep || true"
   fatal 30 "Gateway не отвечает после запуска сервиса"
 }

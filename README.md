@@ -49,7 +49,9 @@ chmod +x ./reset-openclaw-stage.sh
 ```
 
 Скрипт сброса удаляет user-units OpenClaw, system fallback unit `openclaw-gateway-host.service`,
-`~/.openclaw`, установленные `openclaw` бинарники и сбрасывает `tailscale serve` publish из второго этапа.
+гасит orphan `gateway` процессы (включая очистку порта `18789`), удаляет `~/.openclaw`,
+установленные `openclaw` бинарники, временные runtime-файлы `/tmp/openclaw*` и сбрасывает
+`tailscale serve` publish из второго этапа.
 
 Полезные режимы:
 
