@@ -150,15 +150,19 @@ else
   log_info "Режим ввода: interactive wizard (RU)"
 fi
 
-set +e
 if [[ "$MODE" == "infra" ]]; then
-  run_infra_mode
-  rc=$?
+  if run_infra_mode; then
+    rc=0
+  else
+    rc=$?
+  fi
 else
-  run_openclaw_mode
-  rc=$?
+  if run_openclaw_mode; then
+    rc=0
+  else
+    rc=$?
+  fi
 fi
-set -e
 
 if [[ $rc -eq 0 ]]; then
   exit 0

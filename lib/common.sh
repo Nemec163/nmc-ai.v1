@@ -83,34 +83,18 @@ run_cmd() {
 
 run_sudo() {
   if (( DRY_RUN )); then
-    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-      log_info "[dry-run] $*"
-    else
-      log_info "[dry-run] sudo $*"
-    fi
+    log_info "[dry-run] sudo $*"
     return 0
   fi
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    "$@"
-  else
-    sudo "$@"
-  fi
+  sudo "$@"
 }
 
 run_sudo_quiet() {
   if (( DRY_RUN )); then
-    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-      log_info "[dry-run] (quiet) $*"
-    else
-      log_info "[dry-run] sudo (quiet) $*"
-    fi
+    log_info "[dry-run] sudo (quiet) $*"
     return 0
   fi
-  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    "$@" >/dev/null 2>&1
-  else
-    sudo "$@" >/dev/null 2>&1
-  fi
+  sudo "$@" >/dev/null 2>&1
 }
 
 run_as_openclaw() {
@@ -120,7 +104,7 @@ run_as_openclaw() {
     return 0
   fi
   if command -v sudo >/dev/null 2>&1; then
-    run_sudo -iu openclaw bash -lc "$cmd"
+    sudo -iu openclaw bash -lc "$cmd"
   else
     printf '%s\n' "$cmd" | su - openclaw -s /bin/bash -c 'bash -se'
   fi
@@ -133,7 +117,7 @@ run_as_openclaw_sensitive() {
     return 0
   fi
   if command -v sudo >/dev/null 2>&1; then
-    run_sudo -iu openclaw bash -lc "$cmd"
+    sudo -iu openclaw bash -lc "$cmd"
   else
     printf '%s\n' "$cmd" | su - openclaw -s /bin/bash -c 'bash -se'
   fi
