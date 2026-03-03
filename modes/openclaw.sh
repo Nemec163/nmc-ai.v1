@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 OPENCLAW_INSTALLER_URLS_DEFAULT="https://install.openclaw.ai/installer.sh https://openclaw.ai/install.sh"
+OPENCLAW_ENV_EXPORTS='export PNPM_HOME="$HOME/.local/share/pnpm"; export NPM_CONFIG_PREFIX="$HOME/.npm-global"; export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH";'
+OPENCLAW_BIN_PATH="openclaw"
 
 ensure_openclaw_preflight() {
   log_info "Проверка preflight (openclaw)"
@@ -28,16 +30,18 @@ ensure_openclaw_preflight() {
 }
 
 ensure_openclaw_user_pnpm_layout() {
-  log_info "Подготовка pnpm окружения пользователя openclaw"
+  log_info "Подготовка окружения openclaw (pnpm + npm global bin)"
 
-  run_as_openclaw "mkdir -p ~/.local/bin ~/.local/share/pnpm ~/.local/share/pnpm/store"
+  run_as_openclaw "mkdir -p ~/.local/bin ~/.local/share/pnpm ~/.local/share/pnpm/store ~/.npm-global/bin"
+  run_as_openclaw "npm config set prefix ~/.npm-global"
   run_as_openclaw "pnpm config set global-dir ~/.local/share/pnpm"
   run_as_openclaw "pnpm config set global-bin-dir ~/.local/bin"
 
   local block
   block=$(cat <<'BLOCK'
 export PNPM_HOME="$HOME/.local/share/pnpm"
-export PATH="$HOME/.local/bin:$PNPM_HOME:$PATH"
+export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH"
 BLOCK
 )
   ensure_block_in_file "/home/openclaw/.bashrc" "NMC-AI.V1 PNPM" "^$" "$block"
@@ -77,17 +81,44 @@ attempt_official_openclaw_install() {
 
 fallback_install_with_pnpm() {
   log_info "Fallback: установка openclaw@latest через pnpm"
-  run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; pnpm install -g openclaw@latest"
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} pnpm install -g openclaw@latest"
+}
+
+discover_openclaw_binary() {
+  local detected
+
+  detected="$(run_as_openclaw "${OPENCLAW_ENV_EXPORTS} command -v openclaw || true" | tail -n1 | tr -d '\r')"
+  if [[ -n "$detected" ]]; then
+    OPENCLAW_BIN_PATH="$detected"
+    return 0
+  fi
+
+  if run_as_openclaw "test -x /home/openclaw/.npm-global/bin/openclaw"; then
+    OPENCLAW_BIN_PATH="/home/openclaw/.npm-global/bin/openclaw"
+    return 0
+  fi
+
+  if run_as_openclaw "test -x /home/openclaw/.local/bin/openclaw"; then
+    OPENCLAW_BIN_PATH="/home/openclaw/.local/bin/openclaw"
+    return 0
+  fi
+
+  return 1
 }
 
 verify_openclaw_binary() {
   log_info "Проверка установленного OpenClaw"
-  run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; openclaw --version"
+
+  if ! discover_openclaw_binary; then
+    fatal 30 "OpenClaw установлен некорректно: бинарник не найден в PATH пользователя openclaw"
+  fi
+
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" --version"
 }
 
 openclaw_onboard_supports_flag() {
   local flag="$1"
-  if run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; openclaw onboard --help 2>/dev/null | grep -q -- '$flag'"; then
+  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" onboard --help 2>/dev/null | grep -q -- '$flag'"; then
     return 0
   fi
   return 1
@@ -95,13 +126,13 @@ openclaw_onboard_supports_flag() {
 
 run_openclaw_onboard_interactive() {
   log_info "Запуск openclaw onboard --install-daemon (interactive)"
-  run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; openclaw onboard --install-daemon"
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" onboard --install-daemon"
 }
 
 run_openclaw_onboard_non_interactive() {
   log_info "Запуск openclaw onboarding в non-interactive режиме"
 
-  local cmd="export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\";"
+  local cmd="${OPENCLAW_ENV_EXPORTS}"
 
   if [[ -n "${OPENCLAW_PROVIDER:-}" ]]; then
     cmd+=" export OPENCLAW_PROVIDER='${OPENCLAW_PROVIDER}';"
@@ -119,7 +150,7 @@ run_openclaw_onboard_non_interactive() {
     cmd+=" export GEMINI_API_KEY='${GEMINI_API_KEY}';"
   fi
 
-  cmd+=" openclaw onboard --install-daemon"
+  cmd+=" \"${OPENCLAW_BIN_PATH}\" onboard --install-daemon"
 
   if openclaw_onboard_supports_flag "--non-interactive"; then
     cmd+=" --non-interactive"
@@ -166,12 +197,12 @@ verify_openclaw_service() {
 run_openclaw_health_checks() {
   log_info "Проверка состояния OpenClaw"
 
-  run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; openclaw status" || true
+  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" status" || true
 
-  if run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; openclaw doctor --help 2>/dev/null | grep -q -- '--non-interactive'"; then
-    run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; openclaw doctor --non-interactive" || true
+  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --help 2>/dev/null | grep -q -- '--non-interactive'"; then
+    run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor --non-interactive" || true
   else
-    run_as_openclaw "export PNPM_HOME=\"$HOME/.local/share/pnpm\"; export PATH=\"$HOME/.local/bin:$HOME/.local/share/pnpm:$PATH\"; openclaw doctor" || true
+    run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" doctor" || true
   fi
 
   if run_sudo grep -R -E '0\.0\.0\.0|"host"\s*:\s*"0.0.0.0"' /home/openclaw/.openclaw >/dev/null 2>&1; then

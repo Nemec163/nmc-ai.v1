@@ -37,6 +37,28 @@ cp installer.env.example installer.env
 ./nmc-ai.v1.sh --mode openclaw --non-interactive --config ./installer.env
 ```
 
+## Сброс второго этапа (clean retry)
+
+Если `openclaw`-этап запускался неудачно или частично, выполните полный сброс только второго этапа:
+
+```bash
+chmod +x ./reset-openclaw-stage.sh
+./reset-openclaw-stage.sh
+```
+
+Полезные режимы:
+
+```bash
+./reset-openclaw-stage.sh --dry-run
+./reset-openclaw-stage.sh --force
+```
+
+После сброса снова запустите:
+
+```bash
+./nmc-ai.v1.sh --mode openclaw
+```
+
 ## Параметры CLI
 
 - `--mode <infra|openclaw>`
