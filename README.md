@@ -20,7 +20,7 @@
 - `openclaw onboard --install-daemon` + форс `gateway.bind=loopback`
 - форс `gateway.tailscale.mode=serve` (tailnet HTTPS URL)
 - обязательный запуск gateway через `openclaw-gateway*.service` (или fallback `openclaw-gateway-host.service`, если user-systemd недоступен)
-- авто-repair сервиса через `openclaw gateway install --force` и auto-approve pending devices при `pairing required`
+- авто-repair сервиса через `openclaw gateway install --force`; при `pairing required` выводится ручной шаг pairing без auto-approve
 - health checks (`openclaw status`, `openclaw doctor`, `openclaw gateway probe`)
 
 ## Быстрый старт
@@ -49,7 +49,7 @@ chmod +x ./reset-openclaw-stage.sh
 ./reset-openclaw-stage.sh
 ```
 
-Скрипт сброса сначала пытается выполнить официальный `openclaw uninstall --all` (non-interactive),
+Скрипт сброса сначала пытается выполнить официальный `openclaw uninstall` (адаптивно к доступным флагам),
 после чего удаляет user-units OpenClaw, system fallback unit `openclaw-gateway-host.service`,
 гасит orphan `gateway` процессы (включая очистку порта `18789`), удаляет `~/.openclaw*` и XDG
 каталоги OpenClaw, чистит user/root npm/pnpm инсталляцию OpenClaw, временные runtime-файлы

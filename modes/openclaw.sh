@@ -607,33 +607,6 @@ detect_openclaw_gateway_unit() {
   return 0
 }
 
-openclaw_devices_approve_supports_flag() {
-  local flag="$1"
-  if run_as_openclaw "${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" devices approve --help 2>/dev/null | grep -q -- \"$flag\""; then
-    return 0
-  fi
-  return 1
-}
-
-attempt_openclaw_pairing_repair() {
-  log_warn "gateway probe вернул pairing required. Пытаюсь auto-approve pending devices."
-  local base_cmd="${OPENCLAW_ENV_EXPORTS} \"${OPENCLAW_BIN_PATH}\" devices approve --all"
-
-  if openclaw_devices_approve_supports_flag "--yes"; then
-    if run_as_openclaw "${base_cmd} --yes"; then
-      return 0
-    fi
-  fi
-
-  if openclaw_devices_approve_supports_flag "--non-interactive"; then
-    if run_as_openclaw "${base_cmd} --non-interactive"; then
-      return 0
-    fi
-  fi
-
-  run_as_openclaw "${OPENCLAW_ENV_EXPORTS} printf 'yes\n' | \"${OPENCLAW_BIN_PATH}\" devices approve --all"
-}
-
 attempt_openclaw_gateway_service_repair() {
   log_warn "Пробую repair через openclaw gateway install --force"
 
@@ -650,6 +623,19 @@ attempt_openclaw_gateway_service_repair() {
   fi
 
   restart_openclaw_gateway_service_unit
+}
+
+openclaw_gateway_service_is_running() {
+  if [[ -z "${OPENCLAW_GATEWAY_UNIT:-}" ]]; then
+    return 1
+  fi
+
+  if [[ "${OPENCLAW_SERVICE_SCOPE}" == "user" ]]; then
+    openclaw_systemctl_user is-active "$OPENCLAW_GATEWAY_UNIT" >/dev/null 2>&1
+    return $?
+  fi
+
+  run_sudo systemctl is-active --quiet "$OPENCLAW_GATEWAY_UNIT"
 }
 
 install_user_gateway_service_fallback() {
@@ -835,7 +821,6 @@ wait_for_gateway_probe() {
   log_info "Проверка доступности gateway"
 
   local attempt
-  local pairing_repaired=0
   local service_repaired=0
   local last_probe_error=""
   for attempt in $(seq 1 30); do
@@ -848,24 +833,10 @@ wait_for_gateway_probe() {
     last_probe_error="$probe_output"
 
     if printf '%s' "$probe_output" | grep -qi 'pairing required'; then
-      if [[ "$pairing_repaired" -eq 0 ]]; then
-        pairing_repaired=1
-        if attempt_openclaw_pairing_repair; then
-          sleep 1
-          continue
-        fi
+      if openclaw_gateway_service_is_running; then
+        log_warn "Gateway запущен, но gateway probe требует pairing. Pairing выполните вручную: openclaw devices approve <requestId> --url ws://127.0.0.1:${OPENCLAW_GATEWAY_PORT}"
+        return 0
       fi
-
-      if [[ "$service_repaired" -eq 0 ]]; then
-        service_repaired=1
-        if attempt_openclaw_gateway_service_repair; then
-          sleep 1
-          continue
-        fi
-      fi
-
-      sleep 2
-      continue
     fi
 
     if [[ "$service_repaired" -eq 0 ]]; then

@@ -11,7 +11,7 @@ usage() {
 reset-openclaw-stage.sh — полный сброс второго этапа (openclaw)
 
 Что удаляет:
-- официальный OpenClaw uninstall --all (если доступен)
+- официальный OpenClaw uninstall (адаптивно к доступным флагам)
 - user systemd units OpenClaw у пользователя openclaw
 - system-level fallback unit openclaw-gateway-host.service
 - orphan gateway-процессы и занятый порт 18789
@@ -246,8 +246,60 @@ run_official_openclaw_uninstall() {
     return 0
   fi
 
-  log "Официальный OpenClaw uninstall --all (если команда доступна)"
-  run_as_openclaw 'export PNPM_HOME="$HOME/.local/share/pnpm"; export NPM_CONFIG_PREFIX="$HOME/.npm-global"; export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH"; if ! command -v openclaw >/dev/null 2>&1; then exit 0; fi; HELP="$(openclaw uninstall --help 2>&1 || true)"; if [[ -z "$HELP" ]]; then exit 0; fi; if printf "%s" "$HELP" | grep -q -- "--all"; then openclaw uninstall --all --yes --non-interactive >/dev/null 2>&1 || openclaw uninstall --all --yes >/dev/null 2>&1 || printf "yes\n" | openclaw uninstall --all >/dev/null 2>&1 || true; fi; openclaw gateway uninstall >/dev/null 2>&1 || true' || true
+  log "Официальный OpenClaw uninstall (с авто-детектом поддерживаемых флагов)"
+  run_as_openclaw "$(cat <<'EOS'
+set +e
+export PNPM_HOME="$HOME/.local/share/pnpm"
+export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$PNPM_HOME:$PATH"
+
+if ! command -v openclaw >/dev/null 2>&1; then
+  exit 0
+fi
+
+HELP="$(openclaw uninstall --help 2>&1 || true)"
+if [[ -z "$HELP" ]]; then
+  exit 0
+fi
+
+YES_FLAG=""
+NON_INTERACTIVE_FLAG=""
+PRIMARY_FLAGS=""
+FALLBACK_FLAGS=""
+
+if printf "%s" "$HELP" | grep -q -- "--yes"; then
+  YES_FLAG=" --yes"
+fi
+
+if printf "%s" "$HELP" | grep -q -- "--non-interactive"; then
+  NON_INTERACTIVE_FLAG=" --non-interactive"
+fi
+
+if printf "%s" "$HELP" | grep -q -- "--all"; then
+  PRIMARY_FLAGS=" --all"
+else
+  for flag in --service --state --workspace; do
+    if printf "%s" "$HELP" | grep -q -- "$flag"; then
+      PRIMARY_FLAGS="${PRIMARY_FLAGS} ${flag}"
+    fi
+  done
+  if [[ -n "$PRIMARY_FLAGS" ]] && printf "%s" "$HELP" | grep -q -- "--app"; then
+    FALLBACK_FLAGS=" --app"
+  fi
+fi
+
+if [[ -n "$PRIMARY_FLAGS" ]]; then
+  eval "openclaw uninstall${PRIMARY_FLAGS}${YES_FLAG}${NON_INTERACTIVE_FLAG}" >/dev/null 2>&1 || true
+  if [[ -n "$FALLBACK_FLAGS" ]]; then
+    eval "openclaw uninstall${FALLBACK_FLAGS}${YES_FLAG}${NON_INTERACTIVE_FLAG}" >/dev/null 2>&1 || true
+  fi
+else
+  eval "openclaw uninstall${YES_FLAG}${NON_INTERACTIVE_FLAG}" >/dev/null 2>&1 || true
+fi
+
+openclaw gateway uninstall >/dev/null 2>&1 || true
+EOS
+)" || true
 }
 
 reset_tailscale_serve() {
